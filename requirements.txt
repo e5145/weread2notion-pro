@@ -1,6 +1,6 @@
 requests
 notion-client
-github-heatmap
+./tools/weread_heatmap_cookie_shim
 retrying
 pendulum
 python-dotenv
