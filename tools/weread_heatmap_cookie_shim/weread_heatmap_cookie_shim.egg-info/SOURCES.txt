@@ -1,0 +1,8 @@
+setup.py
+weread_heatmap_cookie_shim.py
+weread_heatmap_cookie_shim.egg-info/PKG-INFO
+weread_heatmap_cookie_shim.egg-info/SOURCES.txt
+weread_heatmap_cookie_shim.egg-info/dependency_links.txt
+weread_heatmap_cookie_shim.egg-info/entry_points.txt
+weread_heatmap_cookie_shim.egg-info/requires.txt
+weread_heatmap_cookie_shim.egg-info/top_level.txt
