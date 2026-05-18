@@ -6,6 +6,10 @@ from github_heatmap.cli import main as github_heatmap_main
 
 
 def _normalized_cookie(cookie):
+    cookie = (cookie or "").strip().strip('"').strip("'")
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie.split(":", 1)[1].strip()
+    cookie = cookie.replace("\r", " ").replace("\n", " ")
     if cookie and "&" in cookie and ";" not in cookie:
         return cookie.replace("&", "; ")
     return cookie
@@ -16,6 +20,53 @@ def _normalize_weread_cookie_env():
     normalized = _normalized_cookie(cookie)
     if normalized != cookie:
         os.environ["WEREAD_COOKIE"] = normalized
+
+
+def _install_weread_api_compat():
+    from requests.utils import cookiejar_from_dict
+    from weread2notionpro import weread_api
+
+    original_init = weread_api.WeReadApi.__init__
+
+    def _parse_cookie_string(self):
+        cookies = {}
+        for part in _normalized_cookie(self.cookie).split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            key = key.strip()
+            if not key or key.lower() == "cookie":
+                continue
+            cookies[key] = value.strip()
+
+        missing = [key for key in ("wr_vid", "wr_skey") if key not in cookies]
+        if missing:
+            print(
+                "::warning::WEREAD_COOKIE is missing "
+                + ", ".join(missing)
+                + ". Copy the Cookie request header from an i.weread.qq.com request."
+            )
+        return cookiejar_from_dict(cookies)
+
+    def _init(self):
+        original_init(self)
+        self.cookie = _normalized_cookie(self.cookie)
+        self.session.cookies = self.parse_cookie_string()
+        self.session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://weread.qq.com",
+                "Referer": "https://weread.qq.com/",
+            }
+        )
+
+    weread_api.WeReadApi.parse_cookie_string = _parse_cookie_string
+    weread_api.WeReadApi.__init__ = _init
 
 
 def _disable_secret_setting_sync():
@@ -86,6 +137,7 @@ def main():
 
 def book_main():
     _normalize_weread_cookie_env()
+    _install_weread_api_compat()
     _disable_secret_setting_sync()
     from weread2notionpro.book import main as weread_book_main
 
@@ -94,6 +146,7 @@ def book_main():
 
 def weread_main():
     _normalize_weread_cookie_env()
+    _install_weread_api_compat()
     _disable_secret_setting_sync()
     from weread2notionpro.weread import main as weread_note_main
 
@@ -102,6 +155,7 @@ def weread_main():
 
 def read_time_main():
     _normalize_weread_cookie_env()
+    _install_weread_api_compat()
     _disable_secret_setting_sync()
     from weread2notionpro.read_time import main as weread_read_time_main
 
