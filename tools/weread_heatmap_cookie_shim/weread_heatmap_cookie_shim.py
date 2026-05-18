@@ -1,5 +1,7 @@
 import argparse
+import calendar
 import datetime as dt
+import html
 import hashlib
 import os
 import re
@@ -38,6 +40,16 @@ def _int_env(name, default):
     value = os.getenv(name)
     if not value:
         return default
+
+
+def _arg_value(argv, name, default=None):
+    prefix = name + "="
+    for index, arg in enumerate(argv):
+        if arg == name and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith(prefix):
+            return arg[len(prefix) :]
+    return default
     try:
         return int(value)
     except ValueError:
@@ -233,6 +245,15 @@ class GatewayWeReadApi:
                 for key, value in (data.get("readTimes") or {}).items():
                     read_times[str(key)] = value
         return {"readTimes": read_times}
+
+    def get_year_read_times(self, year):
+        read_times = {}
+        for month in range(1, 13):
+            base_time = int(dt.datetime(year, month, 15, 12, 0, 0).timestamp())
+            data = self._call("/readdata/detail", mode="monthly", baseTime=base_time)
+            for key, value in (data.get("readTimes") or {}).items():
+                read_times[int(key)] = int(value or 0)
+        return read_times
 
     def _read_data_years(self, current_year):
         raw = os.getenv("WEREAD_READDATA_YEARS") or os.getenv("WEREAD_READDATA_YEAR")
@@ -439,8 +460,156 @@ def _ensure_weread_svg(argv):
         )
 
 
+def _date_from_bucket_timestamp(timestamp):
+    return dt.datetime.fromtimestamp(int(timestamp)).date()
+
+
+def _heatmap_level(seconds):
+    if seconds <= 0:
+        return 0
+    if seconds < 10 * 60:
+        return 1
+    if seconds < 30 * 60:
+        return 2
+    if seconds < 60 * 60:
+        return 3
+    return 4
+
+
+def _heatmap_color(seconds, colors):
+    level = _heatmap_level(seconds)
+    return colors[level]
+
+
+def _format_duration(seconds):
+    minutes = int(seconds) // 60
+    hours = minutes // 60
+    rest = minutes % 60
+    if hours and rest:
+        return "%sh %sm" % (hours, rest)
+    if hours:
+        return "%sh" % hours
+    if rest:
+        return "%sm" % rest
+    return "0m"
+
+
+def _generate_gateway_heatmap(argv):
+    year = int(_arg_value(argv, "--year", os.getenv("YEAR") or dt.date.today().year))
+    colors = [
+        _arg_value(argv, "--dom-color", "#EBEDF0"),
+        _arg_value(argv, "--track-color", "#ACE7AE"),
+        _arg_value(argv, "--special-color1", "#69C16E"),
+        _arg_value(argv, "--special-color2", "#549F57"),
+        _arg_value(argv, "--special-color3", "#2F7D32"),
+    ]
+    background = _arg_value(argv, "--background-color", "#FFFFFF")
+    text_color = _arg_value(argv, "--text-color", "#000000")
+    name = _arg_value(argv, "--me", "WeRead")
+
+    client = GatewayWeReadApi()
+    read_times = client.get_year_read_times(year)
+    by_date = {_date_from_bucket_timestamp(key): value for key, value in read_times.items()}
+    total_seconds = sum(by_date.values())
+    active_days = sum(1 for value in by_date.values() if value >= 60)
+
+    first_day = dt.date(year, 1, 1)
+    last_day = dt.date(year, 12, 31)
+    grid_start = first_day - dt.timedelta(days=(first_day.weekday() + 1) % 7)
+    grid_end = last_day + dt.timedelta(days=(5 - last_day.weekday()) % 7)
+    week_count = ((grid_end - grid_start).days // 7) + 1
+
+    cell = 10
+    gap = 3
+    left = 38
+    top = 36
+    width = left + week_count * (cell + gap) + 18
+    height = top + 7 * (cell + gap) + 34
+
+    month_labels = []
+    seen_months = set()
+    cursor = first_day
+    while cursor <= last_day:
+        if cursor.month not in seen_months:
+            week_index = ((cursor - grid_start).days // 7)
+            month_labels.append(
+                '<text x="%s" y="26" fill="%s" font-size="10">%s</text>'
+                % (
+                    left + week_index * (cell + gap),
+                    text_color,
+                    calendar.month_abbr[cursor.month],
+                )
+            )
+            seen_months.add(cursor.month)
+        cursor += dt.timedelta(days=1)
+
+    weekday_labels = []
+    for day_index, label in ((1, "Mon"), (3, "Wed"), (5, "Fri")):
+        weekday_labels.append(
+            '<text x="8" y="%s" fill="%s" font-size="9">%s</text>'
+            % (top + day_index * (cell + gap) + 9, text_color, label)
+        )
+
+    rects = []
+    cursor = grid_start
+    while cursor <= grid_end:
+        week_index = ((cursor - grid_start).days // 7)
+        day_index = (cursor.weekday() + 1) % 7
+        seconds = by_date.get(cursor, 0) if cursor.year == year else 0
+        color = _heatmap_color(seconds, colors) if cursor.year == year else background
+        title = "%s: %s" % (cursor.isoformat(), _format_duration(seconds))
+        rects.append(
+            '<rect x="%s" y="%s" width="%s" height="%s" rx="2" ry="2" fill="%s">'
+            '<title>%s</title></rect>'
+            % (
+                left + week_index * (cell + gap),
+                top + day_index * (cell + gap),
+                cell,
+                cell,
+                color,
+                html.escape(title),
+            )
+        )
+        cursor += dt.timedelta(days=1)
+
+    summary = "%s %s WeRead: %s, %s active days" % (
+        html.escape(str(name)),
+        year,
+        _format_duration(total_seconds),
+        active_days,
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="%s" height="%s" viewBox="0 0 %s %s">'
+        '<rect width="100%%" height="100%%" fill="%s"/>'
+        '<text x="8" y="16" fill="%s" font-family="Arial, sans-serif" font-size="12">%s</text>'
+        '<g font-family="Arial, sans-serif">%s%s%s</g>'
+        "</svg>"
+    ) % (
+        width,
+        height,
+        width,
+        height,
+        background,
+        text_color,
+        summary,
+        "".join(month_labels),
+        "".join(weekday_labels),
+        "".join(rects),
+    )
+
+    out_folder = os.path.join(os.getcwd(), "OUT_FOLDER")
+    os.makedirs(out_folder, exist_ok=True)
+    output_path = os.path.join(out_folder, "weread.svg")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(svg)
+    print("Generated WeRead heatmap from gateway data: %s" % output_path)
+    return 0
+
+
 def main():
     _cleanup_local_build_artifacts()
+    if len(sys.argv) > 1 and sys.argv[1] == "weread" and _gateway_key_from_env():
+        return _generate_gateway_heatmap(sys.argv[:])
     argv = _inject_weread_cookie(sys.argv[:])
     sys.argv = argv
     result = github_heatmap_main()
