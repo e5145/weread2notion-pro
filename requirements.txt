@@ -4,4 +4,3 @@ notion-client
 retrying
 pendulum
 python-dotenv
-weread2notionpro
