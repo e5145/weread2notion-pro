@@ -1,5 +1,4 @@
 requests
-notion-client
 ./tools/weread_heatmap_cookie_shim
 retrying
 pendulum
