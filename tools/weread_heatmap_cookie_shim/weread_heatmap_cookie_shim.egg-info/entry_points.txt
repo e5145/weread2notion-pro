@@ -1,2 +1,0 @@
-[console_scripts]
-github_heatmap = weread_heatmap_cookie_shim:main

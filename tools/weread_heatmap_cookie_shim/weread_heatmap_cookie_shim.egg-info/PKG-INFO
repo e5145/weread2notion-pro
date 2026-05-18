@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: weread-heatmap-cookie-shim
-Version: 0.1.0
-Requires-Dist: github-heatmap==1.0.8
-Dynamic: requires-dist
