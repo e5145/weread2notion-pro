@@ -12,7 +12,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
     env:
       WEREAD_API_KEY: ${{ secrets.WEREAD_API_KEY }}
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
