@@ -1,8 +1,316 @@
+import argparse
+import datetime as dt
+import hashlib
 import os
+import re
 import shutil
 import sys
+import time
 
+import requests
 from github_heatmap.cli import main as github_heatmap_main
+
+
+GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
+DEFAULT_GATEWAY_SKILL_VERSION = "1.0.3"
+
+
+class WeReadGatewayError(RuntimeError):
+    pass
+
+
+def _normalize_gateway_key(value):
+    key = (value or "").strip().strip('"').strip("'")
+    if key.lower().startswith("authorization:"):
+        key = key.split(":", 1)[1].strip()
+    if key.lower().startswith("bearer "):
+        key = key.split(None, 1)[1].strip()
+    if key.lower().startswith("weread_api_key="):
+        key = key.split("=", 1)[1].strip().strip('"').strip("'")
+    return key
+
+
+def _gateway_key_from_env():
+    return _normalize_gateway_key(os.getenv("WEREAD_API_KEY", ""))
+
+
+def _int_env(name, default):
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+class GatewayWeReadApi:
+    """Drop-in WeReadApi replacement backed by the official agent gateway."""
+
+    def __init__(self):
+        self.api_key = _gateway_key_from_env()
+        if not self.api_key:
+            raise Exception("Missing WEREAD_API_KEY. In PowerShell: $env:WEREAD_API_KEY='<your_key>'")
+        self.skill_version = os.getenv("WEREAD_SKILL_VERSION", DEFAULT_GATEWAY_SKILL_VERSION).strip()
+        if not self.skill_version:
+            self.skill_version = DEFAULT_GATEWAY_SKILL_VERSION
+        self.timeout = _int_env("WEREAD_API_TIMEOUT", 30)
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Authorization": "Bearer " + self.api_key,
+                "Content-Type": "application/json",
+                "User-Agent": "weread-heatmap-cookie-shim/gateway",
+            }
+        )
+        self._readinfo_supported = True
+
+    def _call(self, api_name, **params):
+        payload = {"api_name": api_name, "skill_version": self.skill_version}
+        payload.update(params)
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = self.session.post(GATEWAY_URL, json=payload, timeout=self.timeout)
+                if not response.ok:
+                    text = response.text[:400].replace("\r", " ").replace("\n", " ")
+                    raise WeReadGatewayError("%s HTTP %s %s" % (api_name, response.status_code, text))
+                data = response.json()
+                self._raise_for_gateway_error(api_name, data)
+                return data
+            except Exception as exc:  # noqa: BLE001 - this shim keeps retries compact.
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.4 * (attempt + 1))
+        raise WeReadGatewayError("%s failed after retries: %s" % (api_name, last_error))
+
+    @staticmethod
+    def _raise_for_gateway_error(api_name, data):
+        if "upgrade_info" in data:
+            message = data.get("upgrade_info", {}).get("message", "gateway skill requires upgrade")
+            raise WeReadGatewayError("%s: %s" % (api_name, message))
+        errcode = data.get("errcode")
+        if errcode not in (None, 0):
+            message = data.get("errmsg") or data.get("message") or data.get("errstr") or str(errcode)
+            raise WeReadGatewayError("%s: %s" % (api_name, message))
+
+    def get_bookshelf(self):
+        data = self._call("/shelf/sync")
+        if data.get("bookProgress") is None:
+            progress = []
+            for book in data.get("books") or []:
+                progress.append(
+                    {
+                        "bookId": book.get("bookId"),
+                        "readingTime": book.get("readingTime") or book.get("recordReadingTime"),
+                    }
+                )
+            data["bookProgress"] = progress
+        return data
+
+    def get_notebooklist(self):
+        books = []
+        seen = set()
+        last_sort = None
+        while True:
+            params = {"count": 100}
+            if last_sort is not None:
+                params["lastSort"] = last_sort
+            data = self._call("/user/notebooks", **params)
+            page = data.get("books") or []
+            for book in page:
+                book_id = book.get("bookId") or (book.get("book") or {}).get("bookId")
+                marker = (book_id, book.get("sort"))
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                books.append(book)
+            if not data.get("hasMore") or not page:
+                break
+            next_sort = page[-1].get("sort")
+            if not next_sort or next_sort == last_sort:
+                break
+            last_sort = next_sort
+        books.sort(key=lambda item: item.get("sort") or 0)
+        return books
+
+    def get_bookinfo(self, bookId):
+        data = self._call("/book/info", bookId=bookId)
+        if isinstance(data.get("book"), dict) and not data.get("bookId"):
+            return data["book"]
+        return data
+
+    def get_bookmark_list(self, bookId):
+        data = self._call("/book/bookmarklist", bookId=bookId)
+        return data.get("updated") or []
+
+    def get_read_info(self, bookId):
+        params = dict(
+            noteCount=1,
+            readingDetail=1,
+            finishedBookIndex=1,
+            readingBookCount=1,
+            readingBookIndex=1,
+            finishedBookCount=1,
+            bookId=bookId,
+            finishedDate=1,
+        )
+        if self._readinfo_supported:
+            try:
+                return self._call("/book/readinfo", **params)
+            except WeReadGatewayError:
+                self._readinfo_supported = False
+        return self._get_progress_read_info(bookId)
+
+    def _get_progress_read_info(self, bookId):
+        data = self._call("/book/getprogress", bookId=bookId)
+        book = data.get("book") if isinstance(data.get("book"), dict) else data
+        progress = book.get("progress") or book.get("readingProgress") or 0
+        result = {
+            "bookId": bookId,
+            "markedStatus": 4 if progress == 100 else 0,
+            "readingProgress": progress,
+            "readingTime": book.get("recordReadingTime") or book.get("readingTime") or 0,
+            "lastReadingDate": book.get("updateTime"),
+        }
+        if book.get("finishTime"):
+            result["finishedDate"] = book.get("finishTime")
+        return result
+
+    def get_review_list(self, bookId):
+        reviews = []
+        raw_reviews = self._get_review_pages(bookId)
+        for item in raw_reviews:
+            review = item.get("review") if isinstance(item, dict) else item
+            if not isinstance(review, dict):
+                continue
+            review = dict(review)
+            if not review.get("reviewId") and isinstance(item, dict):
+                review["reviewId"] = item.get("reviewId")
+            review.setdefault("bookId", bookId)
+            if review.get("type") == 4 and "chapterUid" not in review:
+                review["chapterUid"] = 1000000
+            reviews.append(review)
+        return reviews
+
+    def get_review_list2(self, bookId):
+        reviews = self.get_review_list(bookId)
+        summary = [review for review in reviews if review.get("type") == 4]
+        note_reviews = []
+        for review in reviews:
+            if review.get("type") != 1:
+                continue
+            item = dict(review)
+            item["markText"] = item.get("content", "")
+            note_reviews.append(item)
+        return summary, note_reviews
+
+    def _get_review_pages(self, bookId):
+        reviews = []
+        synckey = None
+        seen_synckeys = set()
+        while True:
+            params = {"bookid": bookId, "count": 100}
+            if synckey:
+                params["synckey"] = synckey
+            data = self._call("/review/list/mine", **params)
+            reviews.extend(data.get("reviews") or [])
+            next_synckey = data.get("synckey")
+            if not data.get("hasMore") or not next_synckey or next_synckey in seen_synckeys:
+                break
+            seen_synckeys.add(next_synckey)
+            synckey = next_synckey
+        return reviews
+
+    def get_api_data(self):
+        read_times = {}
+        now = dt.datetime.now()
+        for year in self._read_data_years(now.year):
+            last_month = now.month if year == now.year else 12
+            for month in range(1, last_month + 1):
+                base_time = int(dt.datetime(year, month, 15, 12, 0, 0).timestamp())
+                data = self._call("/readdata/detail", mode="monthly", baseTime=base_time)
+                for key, value in (data.get("readTimes") or {}).items():
+                    read_times[str(key)] = value
+        return {"readTimes": read_times}
+
+    def _read_data_years(self, current_year):
+        raw = os.getenv("WEREAD_READDATA_YEARS") or os.getenv("WEREAD_READDATA_YEAR")
+        if not raw:
+            return [current_year]
+        years = set()
+        for part in re.split(r"[\s,;]+", raw):
+            if not part:
+                continue
+            if "-" in part:
+                start, end = part.split("-", 1)
+                if start.strip().isdigit() and end.strip().isdigit():
+                    start_year = int(start)
+                    end_year = int(end)
+                    if start_year > end_year:
+                        start_year, end_year = end_year, start_year
+                    years.update(range(start_year, end_year + 1))
+            elif part.isdigit():
+                years.add(int(part))
+        years = {year for year in years if 2000 <= year <= current_year}
+        return sorted(years) or [current_year]
+
+    def get_chapter_info(self, bookId):
+        data = self._call("/book/chapterinfo", bookId=bookId)
+        chapters = data.get("chapters") or data.get("updated") or []
+        if not chapters and isinstance(data.get("data"), list):
+            first = data["data"][0] if data["data"] else {}
+            chapters = first.get("updated") or first.get("chapters") or []
+        chapters = [dict(chapter) for chapter in chapters if isinstance(chapter, dict)]
+        chapters.append(
+            {
+                "chapterUid": 1000000,
+                "chapterIdx": 1000000,
+                "updateTime": 0,
+                "readAhead": 0,
+                "title": "\u70b9\u8bc4",
+                "level": 1,
+            }
+        )
+        return {item["chapterUid"]: item for item in chapters if item.get("chapterUid") is not None}
+
+    def transform_id(self, book_id):
+        book_id = str(book_id)
+        id_length = len(book_id)
+        if re.match("^\\d*$", book_id):
+            ary = []
+            for i in range(0, id_length, 9):
+                ary.append(format(int(book_id[i : min(i + 9, id_length)]), "x"))
+            return "3", ary
+        result = ""
+        for i in range(id_length):
+            result += format(ord(book_id[i]), "x")
+        return "4", [result]
+
+    def calculate_book_str_id(self, book_id):
+        book_id = str(book_id)
+        md5 = hashlib.md5()
+        md5.update(book_id.encode("utf-8"))
+        digest = md5.hexdigest()
+        result = digest[0:3]
+        code, transformed_ids = self.transform_id(book_id)
+        result += code + "2" + digest[-2:]
+        for index, transformed_id in enumerate(transformed_ids):
+            hex_length_str = format(len(transformed_id), "x")
+            if len(hex_length_str) == 1:
+                hex_length_str = "0" + hex_length_str
+            result += hex_length_str + transformed_id
+            if index < len(transformed_ids) - 1:
+                result += "g"
+        if len(result) < 20:
+            result += digest[0 : 20 - len(result)]
+        md5 = hashlib.md5()
+        md5.update(result.encode("utf-8"))
+        result += md5.hexdigest()[0:3]
+        return result
+
+    def get_url(self, book_id):
+        return "https://weread.qq.com/web/reader/%s" % self.calculate_book_str_id(book_id)
 
 
 def _normalized_cookie(cookie):
@@ -23,8 +331,13 @@ def _normalize_weread_cookie_env():
 
 
 def _install_weread_api_compat():
-    from requests.utils import cookiejar_from_dict
     from weread2notionpro import weread_api
+
+    if _gateway_key_from_env():
+        weread_api.WeReadApi = GatewayWeReadApi
+        return
+
+    from requests.utils import cookiejar_from_dict
 
     original_init = weread_api.WeReadApi.__init__
 
@@ -160,3 +473,59 @@ def read_time_main():
     from weread2notionpro.read_time import main as weread_read_time_main
 
     return weread_read_time_main()
+
+
+def _sync_missing_env():
+    missing = []
+    if not _gateway_key_from_env() and not os.getenv("WEREAD_COOKIE"):
+        missing.append("WEREAD_API_KEY")
+    if not os.getenv("NOTION_TOKEN"):
+        missing.append("NOTION_TOKEN")
+    if not os.getenv("NOTION_PAGE"):
+        missing.append("NOTION_PAGE")
+    return missing
+
+
+def sync_main():
+    parser = argparse.ArgumentParser(description="Sync WeRead books and notes to Notion.")
+    parser.add_argument("--skip-books", action="store_true", help="Do not sync bookshelf/book metadata.")
+    parser.add_argument("--skip-notes", action="store_true", help="Do not sync highlights and reviews.")
+    parser.add_argument("--read-time", action="store_true", help="Also sync daily read-time data.")
+    args = parser.parse_args()
+
+    missing = _sync_missing_env()
+    if missing:
+        print(
+            "Missing environment variables: %s" % ", ".join(missing),
+            file=sys.stderr,
+        )
+        print(
+            "PowerShell example: $env:WEREAD_API_KEY='<key>'; "
+            "$env:NOTION_TOKEN='<secret>'; $env:NOTION_PAGE='<page_url_or_id>'",
+            file=sys.stderr,
+        )
+        return 2
+
+    _normalize_weread_cookie_env()
+    _install_weread_api_compat()
+    _disable_secret_setting_sync()
+
+    if not args.skip_books:
+        print("== Syncing WeRead bookshelf to Notion ==")
+        from weread2notionpro.book import main as weread_book_main
+
+        weread_book_main()
+
+    if not args.skip_notes:
+        print("== Syncing WeRead notes to Notion ==")
+        from weread2notionpro.weread import main as weread_note_main
+
+        weread_note_main()
+
+    if args.read_time:
+        print("== Syncing WeRead read-time data to Notion ==")
+        from weread2notionpro.read_time import main as weread_read_time_main
+
+        weread_read_time_main()
+
+    return 0
