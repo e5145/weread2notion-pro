@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import shutil
+import socket
 import sys
 import time
 
@@ -14,7 +15,10 @@ from github_heatmap.cli import main as github_heatmap_main
 
 
 GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
+GATEWAY_HOST = "i.weread.qq.com"
 DEFAULT_GATEWAY_SKILL_VERSION = "1.0.3"
+_ORIGINAL_GETADDRINFO = socket.getaddrinfo
+_GATEWAY_IPV4_FORCED = False
 
 
 class WeReadGatewayError(RuntimeError):
@@ -34,6 +38,24 @@ def _normalize_gateway_key(value):
 
 def _gateway_key_from_env():
     return _normalize_gateway_key(os.getenv("WEREAD_API_KEY", ""))
+
+
+def _force_gateway_ipv4():
+    """GitHub-hosted runners can prefer IPv6 for WeRead, but often have no IPv6 route."""
+    global _GATEWAY_IPV4_FORCED
+    if _GATEWAY_IPV4_FORCED:
+        return
+    value = os.getenv("WEREAD_FORCE_IPV4", "1").strip().lower()
+    if value in ("0", "false", "no", "off"):
+        return
+
+    def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        if host == GATEWAY_HOST and family in (0, socket.AF_UNSPEC):
+            return _ORIGINAL_GETADDRINFO(host, port, socket.AF_INET, type, proto, flags)
+        return _ORIGINAL_GETADDRINFO(host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = getaddrinfo
+    _GATEWAY_IPV4_FORCED = True
 
 
 def _int_env(name, default):
@@ -60,6 +82,7 @@ class GatewayWeReadApi:
     """Drop-in WeReadApi replacement backed by the official agent gateway."""
 
     def __init__(self):
+        _force_gateway_ipv4()
         self.api_key = _gateway_key_from_env()
         if not self.api_key:
             raise Exception("Missing WEREAD_API_KEY. In PowerShell: $env:WEREAD_API_KEY='<your_key>'")
