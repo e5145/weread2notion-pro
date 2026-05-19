@@ -9,6 +9,7 @@ import shutil
 import socket
 import sys
 import time
+import urllib.parse
 
 import requests
 from github_heatmap.cli import main as github_heatmap_main
@@ -435,6 +436,78 @@ def _disable_secret_setting_sync():
     notion_helper.NotionHelper.insert_to_setting_database = _safe_noop
 
 
+def _is_heatmap_url(url):
+    if not url:
+        return False
+    return url.startswith("https://heatmap.malinkang.com/") or (
+        "raw.githubusercontent.com" in url and "/OUT_FOLDER/" in url
+    )
+
+
+def _extract_heatmap_image_url(url):
+    parsed = urllib.parse.urlparse(url)
+    image_urls = urllib.parse.parse_qs(parsed.query).get("image")
+    if image_urls:
+        return image_urls[0]
+    return url
+
+
+def _install_notion_heatmap_image_update():
+    from weread2notionpro import notion_helper
+
+    def _search_database(self, block_id):
+        children = self.client.blocks.children.list(block_id=block_id)["results"]
+        for child in children:
+            child_type = child.get("type")
+            if child_type == "child_database":
+                self.database_id_dict[child.get("child_database").get("title")] = child.get("id")
+            elif child_type == "embed":
+                if _is_heatmap_url(child.get("embed", {}).get("url")):
+                    self.heatmap_block_id = child.get("id")
+            elif child_type == "image":
+                image = child.get("image", {})
+                external = image.get("external") or {}
+                if _is_heatmap_url(external.get("url")):
+                    self.heatmap_block_id = child.get("id")
+            if child.get("has_children"):
+                self.search_database(child["id"])
+
+    def _update_heatmap(self, block_id, url):
+        image_url = _extract_heatmap_image_url(url)
+        block = self.client.blocks.retrieve(block_id=block_id)
+        if block.get("type") == "image":
+            return self.client.blocks.update(
+                block_id=block_id,
+                image={"type": "external", "external": {"url": image_url}},
+            )
+
+        if block.get("type") == "embed":
+            parent = block.get("parent") or {}
+            parent_id = parent.get("page_id") or parent.get("block_id")
+            if parent_id:
+                response = self.client.blocks.children.append(
+                    block_id=parent_id,
+                    after=block_id,
+                    children=[
+                        {
+                            "object": "block",
+                            "type": "image",
+                            "image": {"type": "external", "external": {"url": image_url}},
+                        }
+                    ],
+                )
+                self.client.blocks.delete(block_id=block_id)
+                results = response.get("results") or []
+                if results:
+                    self.heatmap_block_id = results[0].get("id")
+                return response
+
+        return self.client.blocks.update(block_id=block_id, embed={"url": url})
+
+    notion_helper.NotionHelper.search_database = _search_database
+    notion_helper.NotionHelper.update_heatmap = _update_heatmap
+
+
 def _cleanup_local_build_artifacts():
     roots = {
         os.path.dirname(os.path.abspath(__file__)),
@@ -662,6 +735,7 @@ def read_time_main():
     _normalize_weread_cookie_env()
     _install_weread_api_compat()
     _disable_secret_setting_sync()
+    _install_notion_heatmap_image_update()
     from weread2notionpro.read_time import main as weread_read_time_main
 
     return weread_read_time_main()
