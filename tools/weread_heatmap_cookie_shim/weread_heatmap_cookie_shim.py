@@ -40,6 +40,10 @@ def _int_env(name, default):
     value = os.getenv(name)
     if not value:
         return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def _arg_value(argv, name, default=None):
@@ -50,10 +54,6 @@ def _arg_value(argv, name, default=None):
         if arg.startswith(prefix):
             return arg[len(prefix) :]
     return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
 
 
 class GatewayWeReadApi:
