@@ -478,7 +478,7 @@ def _install_notion_heatmap_image_update():
         if block.get("type") == "image":
             return self.client.blocks.update(
                 block_id=block_id,
-                image={"type": "external", "external": {"url": image_url}},
+                image={"external": {"url": image_url}},
             )
 
         if block.get("type") == "embed":
