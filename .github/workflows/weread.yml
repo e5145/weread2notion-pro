@@ -1,0 +1,48 @@
+name: Sync WeRead Books And Notes
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs every day at 00:30 Asia/Shanghai.
+    - cron: "30 16 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      WEREAD_API_KEY: ${{ secrets.WEREAD_API_KEY }}
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      NOTION_PAGE: ${{ secrets.NOTION_PAGE }}
+      WEREAD_SKILL_VERSION: ${{ vars.WEREAD_SKILL_VERSION }}
+      REPOSITORY: ${{ github.repository }}
+      REF: ${{ github.ref }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          test -n "$WEREAD_API_KEY" || (echo "::error::Missing WEREAD_API_KEY secret" && exit 1)
+          test -n "$NOTION_TOKEN" || (echo "::error::Missing NOTION_TOKEN secret" && exit 1)
+          test -n "$NOTION_PAGE" || (echo "::error::Missing NOTION_PAGE secret" && exit 1)
+
+      - name: Sync bookshelf
+        run: book
+
+      - name: Sync notes
+        run: weread
